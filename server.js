@@ -70,6 +70,40 @@ app.get('/api/admin/stats',requireAdmin,(req,res)=>{const products=db.prepare('S
 function orderNo(){return 'JG-'+new Date().toISOString().slice(0,10).replace(/-/g,'')+'-'+crypto.randomBytes(3).toString('hex').toUpperCase();}
 app.post('/api/orders',apiLimiter,(req,res)=>{const name=clean(req.body?.customer_name,120),phone=clean(req.body?.phone,30),address=clean(req.body?.address,300),city=clean(req.body?.city,80),notes=clean(req.body?.notes,500),payment=clean(req.body?.payment_method||'Cash on Delivery',40),items=Array.isArray(req.body?.items)?req.body.items:[];if(!name||!phone||!address||!city||!items.length)return res.status(400).json({error:'Please complete customer details and cart'});const normalized=items.map(x=>({id:int(x.id,1),quantity:int(x.quantity,1)}));if(normalized.some(x=>!x.id||!x.quantity))return res.status(400).json({error:'Invalid cart'});const tx=db.transaction(()=>{let subtotal=0,discount=0;const rows=[];for(const i of normalized){const p=db.prepare(`SELECT p.*,c.name category FROM products p JOIN categories c ON c.id=p.category_id WHERE p.id=? AND p.active=1`).get(i.id);if(!p)throw new Error('PRODUCT_NOT_FOUND');if(i.quantity>p.stock)throw new Error('STOCK:'+p.name);const line=Math.round(p.price*(100-p.discount)/100)*i.quantity;subtotal+=line;discount+=Math.round(p.price*p.discount/100)*i.quantity;rows.push({p,i,line});}const delivery=subtotal>=5000?0:300;const total=subtotal+delivery;let no=orderNo();while(db.prepare('SELECT 1 FROM orders WHERE order_no=?').get(no))no=orderNo();const r=db.prepare('INSERT INTO orders(order_no,customer_name,phone,address,city,notes,subtotal,discount,delivery_fee,total,payment_method) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(no,name,phone,address,city,notes,subtotal,discount,delivery,total,payment);const oi=db.prepare('INSERT INTO order_items(order_id,product_id,product_name,size,unit_price,quantity,line_total) VALUES(?,?,?,?,?,?,?)');const dec=db.prepare('UPDATE products SET stock=stock-?,updated_at=CURRENT_TIMESTAMP WHERE id=?');rows.forEach(x=>{oi.run(r.lastInsertRowid,x.p.id,x.p.name,x.p.size,Math.round(x.p.price*(100-x.p.discount)/100),x.i.quantity,x.line);dec.run(x.i.quantity,x.p.id)});return {orderId:r.lastInsertRowid,orderNo:no,subtotal,discount,delivery,total};});try{res.status(201).json(tx());}catch(e){if(e.message==='PRODUCT_NOT_FOUND')return res.status(400).json({error:'A product is no longer available'});if(e.message.startsWith('STOCK:'))return res.status(409).json({error:`Not enough stock for ${e.message.slice(6)}`});console.error(e);res.status(500).json({error:'Could not place order'});}});
 app.get('/api/orders/:orderNo',apiLimiter,(req,res)=>{const o=db.prepare('SELECT order_no,customer_name,phone,address,city,subtotal,discount,delivery_fee,total,status,payment_method,created_at FROM orders WHERE order_no=?').get(clean(req.params.orderNo,40));if(!o)return res.status(404).json({error:'Order not found'});o.items=db.prepare('SELECT product_name,size,unit_price,quantity,line_total FROM order_items WHERE order_id=(SELECT id FROM orders WHERE order_no=?)').all(o.order_no);res.json(o);});
+app.get('/health',(req,res)=>{
+  res.status(200).json({
+    status:'ok',
+    service:'jayanthi-grocery',
+    timestamp:new Date().toISOString()
+  });
+});
 app.get('/admin',(req,res)=>res.sendFile(path.join(__dirname,'public','admin.html')));
 app.use((req,res)=>{if(req.path.startsWith('/api/'))return res.status(404).json({error:'Not found'});res.sendFile(path.join(__dirname,'public','index.html'));});
-app.listen(PORT,()=>console.log(`Jayanthi Grocery running on http://localhost:${PORT}`));
+app.get('/health',(req,res)=>{
+  res.status(200).json({
+    status:'ok',
+    service:'jayanthi-grocery',
+    timestamp:new Date().toISOString()
+  });
+});
+const server = app.listen(PORT,()=>{
+  console.log(`Jayanthi Grocery running on http://localhost:${PORT}`);
+});
+
+function shutdown(signal){
+  console.log(`${signal} received. Shutting down...`);
+
+  server.close(()=>{
+    try {
+      db.close();
+      console.log('Database connection closed.');
+      process.exit(0);
+    } catch(err) {
+      console.error('Database shutdown error:',err);
+      process.exit(1);
+    }
+  });
+}
+
+process.on('SIGINT',()=>shutdown('SIGINT'));
+process.on('SIGTERM',()=>shutdown('SIGTERM'));
