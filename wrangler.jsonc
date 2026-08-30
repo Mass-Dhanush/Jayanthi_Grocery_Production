@@ -1,0 +1,13 @@
+{
+  "name": "jayanthi-grocery-production",
+  "main": "worker.js",
+  "compatibility_date": "2026-08-30",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "jayanthi_grocery_db",
+      "database_name": "jayanthi-grocery-db",
+      "database_id": "e9f8afbf-16d8-40aa-9c73-25d002754cbd"
+    }
+  ]
+}
