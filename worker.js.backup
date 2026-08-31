@@ -1,0 +1,1417 @@
+import bcrypt from "bcryptjs";
+
+const json = (data, status = 200, headers = {}) =>
+  Response.json(data, {
+    status,
+    headers: {
+      "Cache-Control": "no-store",
+      ...headers
+    }
+  });
+
+const clean = (v, max = 300) => String(v ?? "").trim().slice(0, max);
+
+const int = (v, min = 0) => {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= min ? n : null;
+};
+
+const slug = (v) =>
+  clean(v, 80)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+
+const publicProduct = (r) => ({
+  ...r,
+  final_price: Math.round(r.price * (100 - r.discount) / 100),
+  in_stock: r.stock > 0
+});
+
+const bytesToHex = (bytes) =>
+  [...new Uint8Array(bytes)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+const hexToBytes = (hex) => {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+};
+
+const sha256 = async (value) => {
+  const data = new TextEncoder().encode(value);
+  return bytesToHex(await crypto.subtle.digest("SHA-256", data));
+};
+
+const hmac = async (value, secret) => {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  return bytesToHex(
+    await crypto.subtle.sign(
+      "HMAC",
+      key,
+      new TextEncoder().encode(value)
+    )
+  );
+};
+
+const randomHex = (bytes = 32) => {
+  const a = new Uint8Array(bytes);
+  crypto.getRandomValues(a);
+  return bytesToHex(a);
+};
+
+const cookieValue = (request) => {
+  const cookie = request.headers.get("Cookie") || "";
+  const m = cookie.match(/(?:^|;\s*)jg_session=([^;]+)/);
+  return m ? m[1] : null;
+};
+
+const getAdmin = async (request, env) => {
+  const raw = cookieValue(request);
+  if (!raw) return null;
+
+  const parts = raw.split(".");
+  if (parts.length !== 2) return null;
+
+  const expectedSignature = await hmac(parts[0], env.SESSION_SECRET);
+
+  if (parts[1].length !== expectedSignature.length) return null;
+  if (parts[1] !== expectedSignature) return null;
+
+  const tokenHash = await sha256(parts[0]);
+
+  const row = await env.jayanthi_grocery_db
+    .prepare(`
+      SELECT
+        s.admin_id,
+        s.expires_at,
+        a.username
+      FROM sessions s
+      JOIN admins a ON a.id=s.admin_id
+      WHERE s.token_hash=?
+    `)
+    .bind(tokenHash)
+    .first();
+
+  if (!row || Number(row.expires_at) < Date.now()) {
+    return null;
+  }
+
+  return row;
+};
+
+const requireAdmin = async (request, env) => {
+  const admin = await getAdmin(request, env);
+  if (!admin) {
+    return {
+      ok: false,
+      response: json({ error: "Unauthorized" }, 401)
+    };
+  }
+
+  return {
+    ok: true,
+    admin
+  };
+};
+
+const checkCsrf = async (request, env) => {
+  const admin = await getAdmin(request, env);
+
+  if (!admin) {
+    return {
+      ok: false,
+      response: json({ error: "Unauthorized" }, 401)
+    };
+  }
+
+  const expected = await hmac(
+    String(admin.admin_id),
+    env.SESSION_SECRET
+  );
+
+  const got = request.headers.get("X-CSRF-Token") || "";
+
+  if (got.length !== expected.length || got !== expected) {
+    return {
+      ok: false,
+      response: json({ error: "CSRF check failed" }, 403)
+    };
+  }
+
+  return {
+    ok: true,
+    admin
+  };
+};
+
+const validateProduct = async (body, env) => {
+  const name = clean(body?.name, 120);
+  const size = clean(body?.size, 50);
+  const category_id = int(body?.category_id, 1);
+  const description = clean(body?.description, 1000);
+  const price = int(body?.price, 0);
+  const stock = int(body?.stock ?? 0, 0);
+  const discount = int(body?.discount ?? 0, 0);
+  const image = clean(body?.image, 500);
+  const icon = clean(body?.icon || "??", 20);
+
+  if (
+    !name ||
+    !size ||
+    !category_id ||
+    price === null ||
+    stock === null ||
+    discount === null ||
+    discount > 100
+  ) {
+    return null;
+  }
+
+  const category = await env.jayanthi_grocery_db
+    .prepare("SELECT id FROM categories WHERE id=? AND active=1")
+    .bind(category_id)
+    .first();
+
+  if (!category) return null;
+
+  return {
+    name,
+    size,
+    category_id,
+    description,
+    price,
+    stock,
+    discount,
+    image,
+    icon
+  };
+};
+
+const orderNo = () =>
+  "JG-" +
+  new Date().toISOString().slice(0, 10).replace(/-/g, "") +
+  "-" +
+  randomHex(3).toUpperCase();
+
+const parseJson = async (request) => {
+  try {
+    return await request.json();
+  } catch {
+    return {};
+  }
+};
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const method = request.method.toUpperCase();
+    const path = url.pathname;
+
+    try {
+      /*
+       * HEALTH
+       */
+      if (method === "GET" && path === "/health") {
+        return json({
+          status: "ok",
+          service: "jayanthi-grocery",
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      /*
+       * PUBLIC CATEGORIES
+       */
+      if (method === "GET" && path === "/api/categories") {
+        const { results } = await env.jayanthi_grocery_db
+          .prepare(`
+            SELECT id,name,slug,image
+            FROM categories
+            WHERE active=1
+            ORDER BY name
+          `)
+          .all();
+
+        return json(results);
+      }
+
+      /*
+       * PUBLIC PRODUCTS
+       */
+      if (method === "GET" && path === "/api/products") {
+        const q = clean(url.searchParams.get("q") || "", 80);
+        const category = clean(
+          url.searchParams.get("category") || "",
+          80
+        );
+        const min = url.searchParams.get("min") || "";
+        const max = url.searchParams.get("max") || "";
+        const sale = url.searchParams.get("sale") || "";
+
+        let sql = `
+          SELECT p.*, c.name AS category
+          FROM products p
+          JOIN categories c ON c.id=p.category_id
+          WHERE p.active=1 AND c.active=1
+        `;
+
+        const args = [];
+
+        if (q) {
+          sql += `
+            AND (
+              p.name LIKE ?
+              OR p.description LIKE ?
+              OR c.name LIKE ?
+            )
+          `;
+          const x = `%${q}%`;
+          args.push(x, x, x);
+        }
+
+        if (category) {
+          sql += " AND c.slug=?";
+          args.push(category);
+        }
+
+        if (min !== "") {
+          const n = int(min);
+          if (n !== null) {
+            sql += " AND p.price>=?";
+            args.push(n);
+          }
+        }
+
+        if (max !== "") {
+          const n = int(max);
+          if (n !== null) {
+            sql += " AND p.price<=?";
+            args.push(n);
+          }
+        }
+
+        if (sale === "1") {
+          sql += " AND p.discount>0";
+        }
+
+        sql += " ORDER BY p.id DESC";
+
+        const { results } = await env.jayanthi_grocery_db
+          .prepare(sql)
+          .bind(...args)
+          .all();
+
+        return json(results.map(publicProduct));
+      }
+
+      /*
+       * PUBLIC SINGLE PRODUCT
+       */
+      const productMatch = path.match(/^\/api\/products\/(\d+)$/);
+
+      if (method === "GET" && productMatch) {
+        const id = Number(productMatch[1]);
+
+        const product = await env.jayanthi_grocery_db
+          .prepare(`
+            SELECT
+              p.*,
+              c.name AS category,
+              c.slug AS category_slug
+            FROM products p
+            JOIN categories c ON c.id=p.category_id
+            WHERE p.id=? AND p.active=1
+          `)
+          .bind(id)
+          .first();
+
+        if (!product) {
+          return json({ error: "Product not found" }, 404);
+        }
+
+        return json(publicProduct(product));
+      }
+
+      /*
+       * ADMIN LOGIN
+       */
+      if (method === "POST" && path === "/api/login") {
+        const body = await parseJson(request);
+
+        const username = clean(body?.username, 80);
+        const password = String(body?.password || "");
+
+        if (!username || !password) {
+          return json({ error: "Invalid login" }, 401);
+        }
+
+        const admin = await env.jayanthi_grocery_db
+          .prepare(`
+            SELECT id,username,password_hash
+            FROM admins
+            WHERE username=?
+          `)
+          .bind(username)
+          .first();
+
+        if (
+          !admin ||
+          !bcrypt.compareSync(password, admin.password_hash)
+        ) {
+          return json({ error: "Invalid login" }, 401);
+        }
+
+        await env.jayanthi_grocery_db
+          .prepare("DELETE FROM sessions WHERE expires_at<?")
+          .bind(Date.now())
+          .run();
+
+        const raw = randomHex(32);
+        const tokenHash = await sha256(raw);
+        const expires = Date.now() + 8 * 60 * 60 * 1000;
+
+        await env.jayanthi_grocery_db
+          .prepare(`
+            INSERT INTO sessions(token_hash,admin_id,expires_at)
+            VALUES(?,?,?)
+          `)
+          .bind(tokenHash, admin.id, expires)
+          .run();
+
+        const signature = await hmac(
+          raw,
+          env.SESSION_SECRET
+        );
+
+        const cookie =
+          `jg_session=${raw}.${signature}; ` +
+          `HttpOnly; SameSite=Lax; Path=/; Max-Age=28800`;
+
+        const csrfToken = await hmac(
+          String(admin.id),
+          env.SESSION_SECRET
+        );
+
+        return json(
+          {
+            ok: true,
+            username: admin.username,
+            csrfToken
+          },
+          200,
+          {
+            "Set-Cookie": cookie
+          }
+        );
+      }
+
+      /*
+       * ADMIN ME
+       */
+      if (method === "GET" && path === "/api/admin/me") {
+        const auth = await requireAdmin(request, env);
+
+        if (!auth.ok) return auth.response;
+
+        const csrfToken = await hmac(
+          String(auth.admin.admin_id),
+          env.SESSION_SECRET
+        );
+
+        return json({
+          username: auth.admin.username,
+          csrfToken
+        });
+      }
+
+      /*
+       * LOGOUT
+       */
+      if (method === "POST" && path === "/api/logout") {
+        const auth = await checkCsrf(request, env);
+
+        if (!auth.ok) return auth.response;
+
+        const raw = cookieValue(request);
+
+        if (raw) {
+          const parts = raw.split(".");
+          if (parts.length === 2) {
+            const tokenHash = await sha256(parts[0]);
+
+            await env.jayanthi_grocery_db
+              .prepare("DELETE FROM sessions WHERE token_hash=?")
+              .bind(tokenHash)
+              .run();
+          }
+        }
+
+        return json(
+          { ok: true },
+          200,
+          {
+            "Set-Cookie":
+              "jg_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
+          }
+        );
+      }
+
+      /*
+       * ADMIN PRODUCTS
+       */
+      if (
+        method === "GET" &&
+        path === "/api/admin/products"
+      ) {
+        const auth = await requireAdmin(request, env);
+
+        if (!auth.ok) return auth.response;
+
+        const { results } = await env.jayanthi_grocery_db
+          .prepare(`
+            SELECT p.*, c.name AS category
+            FROM products p
+            JOIN categories c ON c.id=p.category_id
+            ORDER BY p.id DESC
+          `)
+          .all();
+
+        return json(results.map(publicProduct));
+      }
+
+      if (
+        method === "POST" &&
+        path === "/api/admin/products"
+      ) {
+        const auth = await checkCsrf(request, env);
+
+        if (!auth.ok) return auth.response;
+
+        const body = await parseJson(request);
+        const product = await validateProduct(body, env);
+
+        if (!product) {
+          return json({ error: "Invalid product data" }, 400);
+        }
+
+        const result = await env.jayanthi_grocery_db
+          .prepare(`
+            INSERT INTO products
+            (
+              name,size,category_id,description,
+              price,stock,discount,image,icon
+            )
+            VALUES(?,?,?,?,?,?,?,?,?)
+          `)
+          .bind(
+            product.name,
+            product.size,
+            product.category_id,
+            product.description,
+            product.price,
+            product.stock,
+            product.discount,
+            product.image,
+            product.icon
+          )
+          .run();
+
+        return json(
+          { id: result.meta?.last_row_id },
+          201
+        );
+      }
+
+      const adminProductMatch =
+        path.match(/^\/api\/admin\/products\/(\d+)$/);
+
+      if (adminProductMatch) {
+        const id = Number(adminProductMatch[1]);
+
+        if (method === "PUT") {
+          const auth = await checkCsrf(request, env);
+
+          if (!auth.ok) return auth.response;
+
+          const body = await parseJson(request);
+          const product = await validateProduct(body, env);
+
+          if (!product) {
+            return json(
+              { error: "Invalid product data" },
+              400
+            );
+          }
+
+          const result = await env.jayanthi_grocery_db
+            .prepare(`
+              UPDATE products
+              SET
+                name=?,
+                size=?,
+                category_id=?,
+                description=?,
+                price=?,
+                stock=?,
+                discount=?,
+                image=?,
+                icon=?,
+                updated_at=CURRENT_TIMESTAMP
+              WHERE id=?
+            `)
+            .bind(
+              product.name,
+              product.size,
+              product.category_id,
+              product.description,
+              product.price,
+              product.stock,
+              product.discount,
+              product.image,
+              product.icon,
+              id
+            )
+            .run();
+
+          if (!result.meta?.changes) {
+            return json(
+              { error: "Product not found" },
+              404
+            );
+          }
+
+          return json({ ok: true });
+        }
+
+        if (method === "DELETE") {
+          const auth = await checkCsrf(request, env);
+
+          if (!auth.ok) return auth.response;
+
+          const result = await env.jayanthi_grocery_db
+            .prepare(`
+              UPDATE products
+              SET active=0,
+                  updated_at=CURRENT_TIMESTAMP
+              WHERE id=?
+            `)
+            .bind(id)
+            .run();
+
+          if (!result.meta?.changes) {
+            return json(
+              { error: "Product not found" },
+              404
+            );
+          }
+
+          return json({ ok: true });
+        }
+      }
+
+      /*
+       * ADMIN CATEGORIES
+       */
+      if (
+        method === "GET" &&
+        path === "/api/admin/categories"
+      ) {
+        const auth = await requireAdmin(request, env);
+
+        if (!auth.ok) return auth.response;
+
+        const { results } = await env.jayanthi_grocery_db
+          .prepare(`
+            SELECT *
+            FROM categories
+            ORDER BY name
+          `)
+          .all();
+
+        return json(results);
+      }
+
+      if (
+        method === "POST" &&
+        path === "/api/admin/categories"
+      ) {
+        const auth = await checkCsrf(request, env);
+
+        if (!auth.ok) return auth.response;
+
+        const body = await parseJson(request);
+        const name = clean(body?.name, 80);
+        const image = clean(body?.image, 500);
+
+        if (!name) {
+          return json(
+            { error: "Category name required" },
+            400
+          );
+        }
+
+        try {
+          const result = await env.jayanthi_grocery_db
+            .prepare(`
+              INSERT INTO categories(name,slug,image)
+              VALUES(?,?,?)
+            `)
+            .bind(name, slug(name), image)
+            .run();
+
+          return json(
+            { id: result.meta?.last_row_id },
+            201
+          );
+        } catch {
+          return json(
+            { error: "Category already exists" },
+            409
+          );
+        }
+      }
+
+      const adminCategoryMatch =
+        path.match(/^\/api\/admin\/categories\/(\d+)$/);
+
+      if (adminCategoryMatch) {
+        const id = Number(adminCategoryMatch[1]);
+
+        if (method === "PUT") {
+          const auth = await checkCsrf(request, env);
+
+          if (!auth.ok) return auth.response;
+
+          const body = await parseJson(request);
+          const name = clean(body?.name, 80);
+          const image = clean(body?.image, 500);
+
+          if (!name) {
+            return json(
+              { error: "Invalid category" },
+              400
+            );
+          }
+
+          try {
+            const result = await env.jayanthi_grocery_db
+              .prepare(`
+                UPDATE categories
+                SET name=?,slug=?,image=?
+                WHERE id=?
+              `)
+              .bind(
+                name,
+                slug(name),
+                image,
+                id
+              )
+              .run();
+
+            if (!result.meta?.changes) {
+              return json(
+                { error: "Category not found" },
+                404
+              );
+            }
+
+            return json({ ok: true });
+          } catch {
+            return json(
+              { error: "Category already exists" },
+              409
+            );
+          }
+        }
+
+        if (method === "DELETE") {
+          const auth = await checkCsrf(request, env);
+
+          if (!auth.ok) return auth.response;
+
+          const used = await env.jayanthi_grocery_db
+            .prepare(`
+              SELECT COUNT(*) AS n
+              FROM products
+              WHERE category_id=? AND active=1
+            `)
+            .bind(id)
+            .first();
+
+          if (Number(used?.n || 0)) {
+            return json(
+              { error: "Category has active products" },
+              409
+            );
+          }
+
+          const result = await env.jayanthi_grocery_db
+            .prepare(`
+              UPDATE categories
+              SET active=0
+              WHERE id=?
+            `)
+            .bind(id)
+            .run();
+
+          if (!result.meta?.changes) {
+            return json(
+              { error: "Category not found" },
+              404
+            );
+          }
+
+          return json({ ok: true });
+        }
+      }
+
+      /*
+       * ADMIN ORDERS
+       */
+      if (
+        method === "GET" &&
+        path === "/api/admin/orders"
+      ) {
+        const auth = await requireAdmin(request, env);
+
+        if (!auth.ok) return auth.response;
+
+        const { results } = await env.jayanthi_grocery_db
+          .prepare(`
+            SELECT *
+            FROM orders
+            ORDER BY id DESC
+          `)
+          .all();
+
+        return json(results);
+      }
+
+      const adminOrderMatch =
+        path.match(/^\/api\/admin\/orders\/(\d+)$/);
+
+      if (adminOrderMatch) {
+        const id = Number(adminOrderMatch[1]);
+
+        if (method === "GET") {
+          const auth = await requireAdmin(request, env);
+
+          if (!auth.ok) return auth.response;
+
+          const order = await env.jayanthi_grocery_db
+            .prepare("SELECT * FROM orders WHERE id=?")
+            .bind(id)
+            .first();
+
+          if (!order) {
+            return json(
+              { error: "Order not found" },
+              404
+            );
+          }
+
+          const { results: items } =
+            await env.jayanthi_grocery_db
+              .prepare(`
+                SELECT *
+                FROM order_items
+                WHERE order_id=?
+              `)
+              .bind(id)
+              .all();
+
+          order.items = items;
+
+          return json(order);
+        }
+
+        if (method === "PATCH") {
+          const auth = await checkCsrf(request, env);
+
+          if (!auth.ok) return auth.response;
+
+          const body = await parseJson(request);
+
+          const allowed = [
+            "Pending",
+            "Confirmed",
+            "Processing",
+            "Out for Delivery",
+            "Completed",
+            "Cancelled"
+          ];
+
+          const status = clean(body?.status, 30);
+
+          if (!allowed.includes(status)) {
+            return json(
+              { error: "Invalid status" },
+              400
+            );
+          }
+
+          const oldOrder =
+            await env.jayanthi_grocery_db
+              .prepare(`
+                SELECT status
+                FROM orders
+                WHERE id=?
+              `)
+              .bind(id)
+              .first();
+
+          if (!oldOrder) {
+            return json(
+              { error: "Order not found" },
+              404
+            );
+          }
+
+          const statements = [];
+
+          if (
+            status === "Cancelled" &&
+            oldOrder.status !== "Cancelled"
+          ) {
+            const { results: items } =
+              await env.jayanthi_grocery_db
+                .prepare(`
+                  SELECT product_id,quantity
+                  FROM order_items
+                  WHERE order_id=?
+                `)
+                .bind(id)
+                .all();
+
+            for (const item of items) {
+              statements.push(
+                env.jayanthi_grocery_db
+                  .prepare(`
+                    UPDATE products
+                    SET stock=stock+?,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                  `)
+                  .bind(
+                    item.quantity,
+                    item.product_id
+                  )
+              );
+            }
+          }
+
+          statements.push(
+            env.jayanthi_grocery_db
+              .prepare(`
+                UPDATE orders
+                SET status=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+              `)
+              .bind(status, id)
+          );
+
+          await env.jayanthi_grocery_db.batch(
+            statements
+          );
+
+          return json({ ok: true });
+        }
+      }
+
+      /*
+       * ADMIN STATS
+       */
+      if (
+        method === "GET" &&
+        path === "/api/admin/stats"
+      ) {
+        const auth = await requireAdmin(request, env);
+
+        if (!auth.ok) return auth.response;
+
+        const products =
+          await env.jayanthi_grocery_db
+            .prepare(`
+              SELECT COUNT(*) AS n
+              FROM products
+              WHERE active=1
+            `)
+            .first();
+
+        const low =
+          await env.jayanthi_grocery_db
+            .prepare(`
+              SELECT COUNT(*) AS n
+              FROM products
+              WHERE active=1 AND stock<=5
+            `)
+            .first();
+
+        const orders =
+          await env.jayanthi_grocery_db
+            .prepare(`
+              SELECT COUNT(*) AS n
+              FROM orders
+            `)
+            .first();
+
+        const revenue =
+          await env.jayanthi_grocery_db
+            .prepare(`
+              SELECT COALESCE(SUM(total),0) AS n
+              FROM orders
+              WHERE status!='Cancelled'
+            `)
+            .first();
+
+        return json({
+          products: Number(products?.n || 0),
+          low: Number(low?.n || 0),
+          orders: Number(orders?.n || 0),
+          revenue: Number(revenue?.n || 0)
+        });
+      }
+
+      /*
+       * CUSTOMER ORDER CREATE
+       */
+      if (
+        method === "POST" &&
+        path === "/api/orders"
+      ) {
+        const body = await parseJson(request);
+
+        const name = clean(
+          body?.customer_name,
+          120
+        );
+
+        const phone = clean(
+          body?.phone,
+          30
+        );
+
+        const address = clean(
+          body?.address,
+          300
+        );
+
+        const city = clean(
+          body?.city,
+          80
+        );
+
+        const rawNotes = clean(
+          body?.notes,
+          450
+        );
+
+        const notes =
+          deliveryMethod === "pickup"
+            ? `[PICKUP] ${rawNotes}`.trim()
+            : rawNotes;
+
+        const payment = clean(
+          body?.payment_method ||
+            "Cash on Delivery",
+          40
+        );
+
+        const deliveryMethod =
+          body?.delivery_method === "pickup"
+            ?"pickup"
+        :"delivery";
+
+        const items = Array.isArray(body?.items)
+          ? body.items
+          : [];
+
+        const deliveryMethod =
+         body?.delivery_method === "pickup"
+          ? "pickup"
+          : "delivery";
+
+        if (
+          !name ||
+          !phone ||
+          !items.length ||
+          (deliveryMethod === "delivery" && (!address || !city))
+        ) {
+          return json(
+            {
+              error:
+                "Please complete customer details and cart"
+            },
+            400
+          );
+} 
+{
+          return json(
+            {
+              error:
+                "Please complete customer details and cart"
+            },
+            400
+          );
+        }
+
+        const normalized = items.map((x) => ({
+          id: int(x.id, 1),
+          quantity: int(x.quantity, 1)
+        }));
+
+        if (
+          normalized.some(
+            (x) => !x.id || !x.quantity
+          )
+        ) {
+          return json(
+            { error: "Invalid cart" },
+            400
+          );
+        }
+
+        let subtotal = 0;
+        let discount = 0;
+        const rows = [];
+
+        for (const item of normalized) {
+          const product =
+            await env.jayanthi_grocery_db
+              .prepare(`
+                SELECT
+                  p.*,
+                  c.name AS category
+                FROM products p
+                JOIN categories c
+                  ON c.id=p.category_id
+                WHERE p.id=? AND p.active=1
+              `)
+              .bind(item.id)
+              .first();
+
+          if (!product) {
+            return json(
+              {
+                error:
+                  "A product is no longer available"
+              },
+              400
+            );
+          }
+
+          if (item.quantity > product.stock) {
+            return json(
+              {
+                error:
+                  `Not enough stock for ${product.name}`
+              },
+              409
+            );
+          }
+
+          const unitPrice = Math.round(
+            product.price *
+              (100 - product.discount) /
+              100
+          );
+
+          const line =
+            unitPrice * item.quantity;
+
+          subtotal += line;
+
+          discount +=
+            Math.round(
+              product.price *
+                product.discount /
+                100
+            ) * item.quantity;
+
+          rows.push({
+            product,
+            item,
+            line,
+            unitPrice
+          });
+        }
+
+        const delivery =
+          deliveryMethod === "pickup"
+            ? 0
+            : subtotal >= 5000
+              ? 0
+               : 300;
+
+        const total =
+          subtotal + delivery;
+
+        let no = orderNo();
+
+        const existing =
+          await env.jayanthi_grocery_db
+            .prepare(
+              "SELECT 1 FROM orders WHERE order_no=?"
+            )
+            .bind(no)
+            .first();
+
+        if (existing) {
+          no = orderNo();
+        }
+
+        const statements = [];
+
+        statements.push(
+          env.jayanthi_grocery_db
+            .prepare(`
+              INSERT INTO orders
+              (
+                order_no,
+                customer_name,
+                phone,
+                address,
+                city,
+                notes,
+                subtotal,
+                discount,
+                delivery_fee,
+                total,
+                payment_method
+              )
+              VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            `)
+            .bind(
+              no,
+              name,
+              phone,
+              address,
+              city,
+              notes,
+              subtotal,
+              discount,
+              delivery,
+              total,
+              payment
+            )
+        );
+
+        /*
+         * We need the inserted order ID.
+         * D1 batch metadata does not reliably expose it
+         * for subsequent statements, so insert the order
+         * first, then batch the dependent writes.
+         */
+        const orderResult =
+          await env.jayanthi_grocery_db
+            .prepare(`
+              INSERT INTO orders
+              (
+                order_no,
+                customer_name,
+                phone,
+                address,
+                city,
+                notes,
+                subtotal,
+                discount,
+                delivery_fee,
+                total,
+                payment_method
+              )
+              VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            `)
+            .bind(
+              no,
+              name,
+              phone,
+              address,
+              city,
+              notes,
+              subtotal,
+              discount,
+              delivery,
+              total,
+              payment
+            )
+            .run();
+
+        const orderId =
+          orderResult.meta?.last_row_id;
+
+        if (!orderId) {
+          return json(
+            { error: "Could not place order" },
+            500
+          );
+        }
+
+        const writes = [];
+
+        for (const row of rows) {
+          writes.push(
+            env.jayanthi_grocery_db
+              .prepare(`
+                INSERT INTO order_items
+                (
+                  order_id,
+                  product_id,
+                  product_name,
+                  size,
+                  unit_price,
+                  quantity,
+                  line_total
+                )
+                VALUES(?,?,?,?,?,?,?)
+              `)
+              .bind(
+                orderId,
+                row.product.id,
+                row.product.name,
+                row.product.size,
+                row.unitPrice,
+                row.item.quantity,
+                row.line
+              )
+          );
+
+          writes.push(
+            env.jayanthi_grocery_db
+              .prepare(`
+                UPDATE products
+                SET stock=stock-?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND stock>=?
+              `)
+              .bind(
+                row.item.quantity,
+                row.product.id,
+                row.item.quantity
+              )
+          );
+        }
+
+        await env.jayanthi_grocery_db.batch(writes);
+
+        return json(
+          {
+            orderId,
+            orderNo: no,
+            subtotal,
+            discount,
+            delivery,
+            total
+          },
+          201
+        );
+      }
+
+      /*
+       * CUSTOMER ORDER LOOKUP
+       */
+      const orderLookup =
+        path.match(/^\/api\/orders\/([^/]+)$/);
+
+      if (
+        method === "GET" &&
+        orderLookup
+      ) {
+        const orderNoValue = clean(
+          decodeURIComponent(orderLookup[1]),
+          40
+        );
+
+        const order =
+          await env.jayanthi_grocery_db
+            .prepare(`
+              SELECT
+                order_no,
+                customer_name,
+                phone,
+                address,
+                city,
+                subtotal,
+                discount,
+                delivery_fee,
+                total,
+                status,
+                payment_method,
+                created_at
+              FROM orders
+              WHERE order_no=?
+            `)
+            .bind(orderNoValue)
+            .first();
+
+        if (!order) {
+          return json(
+            { error: "Order not found" },
+            404
+          );
+        }
+
+        const { results: items } =
+          await env.jayanthi_grocery_db
+            .prepare(`
+              SELECT
+                product_name,
+                size,
+                unit_price,
+                quantity,
+                line_total
+              FROM order_items
+              WHERE order_id=(
+                SELECT id
+                FROM orders
+                WHERE order_no=?
+              )
+            `)
+            .bind(orderNoValue)
+            .all();
+
+        order.items = items;
+
+        return json(order);
+      }
+
+      /*
+       * API 404
+       */
+      if (path.startsWith("/api/")) {
+        return json(
+          { error: "API endpoint not found" },
+          404
+        );
+      }
+
+      /*
+       * STATIC ASSETS
+       */
+      return env.ASSETS.fetch(request);
+
+    } catch (error) {
+      console.error("Worker error:", error);
+
+      return json(
+        {
+          error: "Internal server error"
+        },
+        500
+      );
+    }
+  }
+};
+
+
