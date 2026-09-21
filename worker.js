@@ -207,7 +207,7 @@ const orderNo = () =>
 const parseJson = async (request) => {
   try {
     const text = await request.text();
-    console.log("ORDER RAW BODY:", text);
+    console.log("ORDER DEBUG:", JSON.stringify(body));
     return text ? JSON.parse(text) : {};
   } catch (err) {
     console.error("JSON PARSE ERROR:", String(err));
