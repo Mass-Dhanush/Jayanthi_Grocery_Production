@@ -351,7 +351,6 @@ export default {
        */
       if (method === "POST" && path === "/api/login") {
         const body = await parseJson(request);
-        console.log("ORDER DEBUG:", JSON.stringify(body));
 
         const username = clean(body?.username, 80);
         const password = String(body?.password || "");
@@ -503,7 +502,6 @@ export default {
         if (!auth.ok) return auth.response;
 
         const body = await parseJson(request);
-        console.log("ORDER DEBUG:", JSON.stringify(body));
         const product = await validateProduct(body, env);
 
         if (!product) {
@@ -550,7 +548,6 @@ export default {
           if (!auth.ok) return auth.response;
 
           const body = await parseJson(request);
-        console.log("ORDER DEBUG:", JSON.stringify(body));
           const product = await validateProduct(body, env);
 
           if (!product) {
@@ -657,7 +654,6 @@ export default {
         if (!auth.ok) return auth.response;
 
         const body = await parseJson(request);
-        console.log("ORDER DEBUG:", JSON.stringify(body));
         const name = clean(body?.name, 80);
         const image = clean(body?.image, 500);
 
@@ -701,7 +697,6 @@ export default {
           if (!auth.ok) return auth.response;
 
           const body = await parseJson(request);
-        console.log("ORDER DEBUG:", JSON.stringify(body));
           const name = clean(body?.name, 80);
           const image = clean(body?.image, 500);
 
@@ -850,7 +845,6 @@ export default {
           if (!auth.ok) return auth.response;
 
           const body = await parseJson(request);
-        console.log("ORDER DEBUG:", JSON.stringify(body));
 
           const allowed = [
             "Pending",
@@ -1001,7 +995,6 @@ export default {
         path === "/api/orders"
       ) {
         const body = await parseJson(request);
-        console.log("ORDER DEBUG:", JSON.stringify(body));
 
         const name = clean(
           body?.customer_name,
